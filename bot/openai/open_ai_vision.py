@@ -28,7 +28,7 @@ class OpenAIVision(object):
         msg.prepare()
         logger.info(f"[CHATGPT] query with images, path={path}")
         payload = {
-            "model": const.GPT4_VISION_PREVIEW,
+            "model": const.GPT4o_MINI,
             "messages": self.build_vision_msg(query, path),
             "temperature": conf().get("temperature"),
             "top_p": conf().get("top_p", 1),

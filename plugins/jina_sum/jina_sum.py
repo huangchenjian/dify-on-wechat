@@ -1,4 +1,5 @@
 # encoding:utf-8
+import base64
 import json
 import os
 import html
@@ -7,10 +8,17 @@ from urllib.parse import urlparse
 import requests
 
 import plugins
+from bridge.bridge import Bridge
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
+from channel.chat_message import ChatMessage
+from common import utils, memory
 from common.log import logger
 from plugins import *
+from plugins.jina_sum.util import upload_img
+
+from common.expired_dict import ExpiredDict
+IMAGE_CACHE = ExpiredDict(60 * 3)
 
 @plugins.register(
     name="JinaSum",
@@ -57,34 +65,96 @@ class JinaSum(Plugin):
         try:
             context = e_context["context"]
             content = context.content
-            if context.type != ContextType.SHARING and context.type != ContextType.TEXT:
-                return
-            if not self._check_url(content):
-                logger.debug(f"[JinaSum] {content} is not a valid url, skip")
-                return
-            if retry_count == 0:
-                logger.debug("[JinaSum] on_handle_context. content: %s" % content)
-                reply = Reply(ReplyType.TEXT, "🎉正在为您生成总结，请稍候...")
+            if context.type == ContextType.SHARING:
+                if not self._check_url(content):
+                    logger.debug(f"[JinaSum] {content} is not a valid url, skip")
+                    return
+                if retry_count == 0:
+                    logger.debug("[JinaSum] on_handle_context. content: %s" % content)
+                    reply = Reply(ReplyType.TEXT, "🎉正在为您生成总结，请稍候...")
+                    channel = e_context["channel"]
+                    channel.send(reply, context)
+
+                target_url = html.unescape(content) # 解决公众号卡片链接校验问题，参考 https://github.com/fatwang2/sum4all/commit/b983c49473fc55f13ba2c44e4d8b226db3517c45
+                jina_url = self._get_jina_url(target_url)
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+                response = requests.get(jina_url, headers=headers, timeout=60)
+                response.raise_for_status()
+                target_url_content = response.text
+
+                openai_chat_url = self._get_openai_chat_url()
+                openai_headers = self._get_openai_headers()
+                openai_payload = self._get_openai_payload(target_url_content)
+                logger.debug(f"[JinaSum] openai_chat_url: {openai_chat_url}, openai_headers: {openai_headers}, openai_payload: {openai_payload}")
+                response = requests.post(openai_chat_url, headers={**openai_headers, **headers}, json=openai_payload, timeout=60)
+                response.raise_for_status()
+                result = response.json()['choices'][0]['message']['content']
+                reply = Reply(ReplyType.TEXT, result)
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+            if context.type in [ContextType.TEXT]:
+                msg: ChatMessage = e_context["context"]["msg"]
+                img_cache = IMAGE_CACHE.get(context["session_id"])
+                if img_cache:
+                    IMAGE_CACHE[context["session_id"]] = None
+                    img_url = img_cache['path']
+                    messages = self.build_vision_msg(msg.content, img_url)
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+                    openai_chat_url = self._get_openai_chat_url()
+                    openai_headers = self._get_openai_headers()
+                    openai_payload = {
+                        'model': self.open_ai_model,
+                        'messages': messages
+                    }
+                    all_sessions = Bridge().get_bot("chat").sessions
+                    session = all_sessions.build_session(e_context["context"]["session_id"])
+                    session.add_messages(messages)
+                    response = requests.post(openai_chat_url, headers={**openai_headers, **headers}, json=openai_payload,
+                                             timeout=60)
+                    response.raise_for_status()
+                    result = response.json()['choices'][0]['message']['content']
+                    reply = Reply(ReplyType.TEXT, result)
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    all_sessions.add_reply(result)
+
+
+            if context.type in [ContextType.FILE, ContextType.IMAGE]:
+                reply = Reply(ReplyType.TEXT, "🎉正在接收你的图片，请稍候...")
                 channel = e_context["channel"]
                 channel.send(reply, context)
+                msg: ChatMessage = e_context["context"]["msg"]
+                msg.prepare()
+                file_path = context.content
+                img_url = upload_img(file_path)
 
-            target_url = html.unescape(content) # 解决公众号卡片链接校验问题，参考 https://github.com/fatwang2/sum4all/commit/b983c49473fc55f13ba2c44e4d8b226db3517c45
-            jina_url = self._get_jina_url(target_url)
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
-            response = requests.get(jina_url, headers=headers, timeout=60)
-            response.raise_for_status()
-            target_url_content = response.text
+                query = "我已收到了你的图片，请问你有什么需要？"
+                reply = Reply(ReplyType.TEXT, query)
 
-            openai_chat_url = self._get_openai_chat_url()
-            openai_headers = self._get_openai_headers()
-            openai_payload = self._get_openai_payload(target_url_content)
-            logger.debug(f"[JinaSum] openai_chat_url: {openai_chat_url}, openai_headers: {openai_headers}, openai_payload: {openai_payload}")
-            response = requests.post(openai_chat_url, headers={**openai_headers, **headers}, json=openai_payload, timeout=60)
-            response.raise_for_status()
-            result = response.json()['choices'][0]['message']['content']
-            reply = Reply(ReplyType.TEXT, result)
-            e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS
+
+
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK
+                IMAGE_CACHE[context["session_id"]] = {
+                    "path": img_url,
+                    "msg": context.get("msg")
+                }
+                # messages = self.build_vision_msg(query, img_url)
+                # headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+                # openai_chat_url = self._get_openai_chat_url()
+                # openai_headers = self._get_openai_headers()
+                # openai_payload = {
+                #     'model': self.open_ai_model,
+                #     'messages': messages
+                # }
+                # response = requests.post(openai_chat_url, headers={**openai_headers, **headers}, json=openai_payload,
+                #                          timeout=60)
+                # response.raise_for_status()
+                # result = response.json()['choices'][0]['message']['content']
+                # reply = Reply(ReplyType.TEXT, result)
+                # e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+
 
         except Exception as e:
             if retry_count < 3:
@@ -150,3 +220,22 @@ class JinaSum(Plugin):
                 return False
 
         return True
+
+    def build_vision_msg(self, query: str, path: str):
+        suffix = utils.get_path_suffix(path)
+        messages = [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": query
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": path
+                    }
+                }
+            ]
+        }]
+        return messages

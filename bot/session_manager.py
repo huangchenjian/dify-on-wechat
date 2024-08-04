@@ -24,6 +24,8 @@ class Session(object):
     def add_query(self, query):
         user_item = {"role": "user", "content": query}
         self.messages.append(user_item)
+    def add_messages(self,messages):
+        self.messages.extend(messages)
 
     def add_reply(self, reply):
         assistant_item = {"role": "assistant", "content": reply}
